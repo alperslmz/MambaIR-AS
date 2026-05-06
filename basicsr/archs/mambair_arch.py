@@ -892,3 +892,721 @@ class Upsample(nn.Sequential):
         else:
             raise ValueError(f'scale {scale} is not supported. Supported scales: 2^n and 3.')
         super(Upsample, self).__init__(*m)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ablation: MambaIR_noCA  — identical to MambaIR but with ChannelAttention
+#           removed from every CAB block.  This leaves channel redundancy
+#           unmitigated and serves as a controlled ablation baseline.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CAB_noCA(nn.Module):
+    """CAB without the ChannelAttention (CA) layer.
+
+    For lightweight SR (is_light_sr=True) the path is:
+        1×1 conv → DWConv 3×3 → GELU → 1×1 conv → DWConv 3×3 dilated(2)
+    For classical SR (is_light_sr=False) the path is:
+        3×3 conv → GELU → 3×3 conv
+    The ChannelAttention squeeze-excite head is intentionally omitted.
+    """
+
+    def __init__(self, num_feat, is_light_sr=False, compress_ratio=3, squeeze_factor=30):
+        super(CAB_noCA, self).__init__()
+        if is_light_sr:
+            compress_ratio = 2
+            self.cab = nn.Sequential(
+                nn.Conv2d(num_feat, num_feat // compress_ratio, 1, 1, 0),
+                nn.Conv2d(num_feat // compress_ratio, num_feat // compress_ratio, 3, 1, 1,
+                          groups=num_feat // compress_ratio),
+                nn.GELU(),
+                nn.Conv2d(num_feat // compress_ratio, num_feat, 1, 1, 0),
+                nn.Conv2d(num_feat, num_feat, 3, 1, padding=2, groups=num_feat, dilation=2),
+                # ChannelAttention intentionally removed for ablation
+            )
+        else:
+            self.cab = nn.Sequential(
+                nn.Conv2d(num_feat, num_feat // compress_ratio, 3, 1, 1),
+                nn.GELU(),
+                nn.Conv2d(num_feat // compress_ratio, num_feat, 3, 1, 1),
+                # ChannelAttention intentionally removed for ablation
+            )
+
+    def forward(self, x):
+        return self.cab(x)
+
+
+class VSSBlock_noCA(nn.Module):
+    """VSSBlock with CAB_noCA instead of CAB (ChannelAttention removed)."""
+
+    def __init__(
+            self,
+            hidden_dim: int = 0,
+            drop_path: float = 0,
+            norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+            attn_drop_rate: float = 0,
+            d_state: int = 16,
+            expand: float = 2.,
+            is_light_sr: bool = False,
+            **kwargs,
+    ):
+        super().__init__()
+        self.ln_1 = norm_layer(hidden_dim)
+        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state, expand=expand,
+                                   dropout=attn_drop_rate, **kwargs)
+        self.drop_path = DropPath(drop_path)
+        self.skip_scale = nn.Parameter(torch.ones(hidden_dim))
+        self.conv_blk = CAB_noCA(hidden_dim, is_light_sr)
+        self.ln_2 = nn.LayerNorm(hidden_dim)
+        self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
+
+    def forward(self, input, x_size):
+        B, L, C = input.shape
+        input = input.view(B, *x_size, C).contiguous()
+        x = self.ln_1(input)
+        x = input * self.skip_scale + self.drop_path(self.self_attention(x))
+        x = x * self.skip_scale2 + self.conv_blk(
+            self.ln_2(x).permute(0, 3, 1, 2).contiguous()
+        ).permute(0, 2, 3, 1).contiguous()
+        x = x.view(B, -1, C).contiguous()
+        return x
+
+
+class BasicLayer_noCA(nn.Module):
+    """BasicLayer variant that uses VSSBlock_noCA (no ChannelAttention)."""
+
+    def __init__(self, dim, input_resolution, depth, drop_path=0., d_state=16,
+                 mlp_ratio=2., norm_layer=nn.LayerNorm, downsample=None,
+                 use_checkpoint=False, is_light_sr=False):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.depth = depth
+        self.mlp_ratio = mlp_ratio
+        self.use_checkpoint = use_checkpoint
+
+        self.blocks = nn.ModuleList()
+        for i in range(depth):
+            self.blocks.append(VSSBlock_noCA(
+                hidden_dim=dim,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                norm_layer=nn.LayerNorm,
+                attn_drop_rate=0,
+                d_state=d_state,
+                expand=self.mlp_ratio,
+                input_resolution=input_resolution,
+                is_light_sr=is_light_sr,
+            ))
+
+        if downsample is not None:
+            self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
+        else:
+            self.downsample = None
+
+    def forward(self, x, x_size):
+        for blk in self.blocks:
+            if self.use_checkpoint:
+                x = checkpoint.checkpoint(blk, x)
+            else:
+                x = blk(x, x_size)
+        if self.downsample is not None:
+            x = self.downsample(x)
+        return x
+
+    def extra_repr(self) -> str:
+        return f'dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}'
+
+
+class ResidualGroup_noCA(nn.Module):
+    """ResidualGroup using BasicLayer_noCA (no ChannelAttention inside VSSBlocks)."""
+
+    def __init__(self, dim, input_resolution, depth, d_state=16, mlp_ratio=4.,
+                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None,
+                 use_checkpoint=False, img_size=None, patch_size=None,
+                 resi_connection='1conv', is_light_sr=False):
+        super(ResidualGroup_noCA, self).__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+
+        self.residual_group = BasicLayer_noCA(
+            dim=dim,
+            input_resolution=input_resolution,
+            depth=depth,
+            d_state=d_state,
+            mlp_ratio=mlp_ratio,
+            drop_path=drop_path,
+            norm_layer=norm_layer,
+            downsample=downsample,
+            use_checkpoint=use_checkpoint,
+            is_light_sr=is_light_sr,
+        )
+
+        if resi_connection == '1conv':
+            self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
+        elif resi_connection == '3conv':
+            self.conv = nn.Sequential(
+                nn.Conv2d(dim, dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(dim // 4, dim // 4, 1, 1, 0), nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(dim // 4, dim, 3, 1, 1))
+
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim, norm_layer=None)
+        self.patch_unembed = PatchUnEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim, norm_layer=None)
+
+    def forward(self, x, x_size):
+        return self.patch_embed(
+            self.conv(self.patch_unembed(self.residual_group(x, x_size), x_size))
+        ) + x
+
+
+@ARCH_REGISTRY.register()
+class MambaIR_noCA(nn.Module):
+    r"""MambaIR_noCA — Ablation model identical to MambaIR but with the
+    ChannelAttention (CA) layer removed from every CAB block.
+
+    Purpose: measure performance drop caused by unmitigated channel redundancy
+    when the CA squeeze-excite mechanism is absent.
+
+    All constructor arguments are identical to MambaIR.
+    """
+
+    def __init__(self,
+                 img_size=64,
+                 patch_size=1,
+                 in_chans=3,
+                 embed_dim=96,
+                 depths=(6, 6, 6, 6),
+                 drop_rate=0.,
+                 d_state=16,
+                 mlp_ratio=2.,
+                 drop_path_rate=0.1,
+                 norm_layer=nn.LayerNorm,
+                 patch_norm=True,
+                 use_checkpoint=False,
+                 upscale=2,
+                 img_range=1.,
+                 upsampler='',
+                 resi_connection='1conv',
+                 **kwargs):
+        super(MambaIR_noCA, self).__init__()
+        num_in_ch = in_chans
+        num_out_ch = in_chans
+        num_feat = 64
+        self.img_range = img_range
+        if in_chans == 3:
+            rgb_mean = (0.4488, 0.4371, 0.4040)
+            self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
+        else:
+            self.mean = torch.zeros(1, 1, 1, 1)
+        self.upscale = upscale
+        self.upsampler = upsampler
+        self.mlp_ratio = mlp_ratio
+
+        # 1. Shallow feature extraction
+        self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
+
+        # 2. Deep feature extraction
+        self.num_layers = len(depths)
+        self.embed_dim = embed_dim
+        self.patch_norm = patch_norm
+        self.num_features = embed_dim
+
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=embed_dim,
+            embed_dim=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
+        num_patches = self.patch_embed.num_patches
+        patches_resolution = self.patch_embed.patches_resolution
+        self.patches_resolution = patches_resolution
+
+        self.patch_unembed = PatchUnEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=embed_dim,
+            embed_dim=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
+
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        self.is_light_sr = True if self.upsampler == 'pixelshuffledirect' else False
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+
+        # Build Residual State Space Groups (RSSG) — CA-free variant
+        self.layers = nn.ModuleList()
+        for i_layer in range(self.num_layers):
+            layer = ResidualGroup_noCA(
+                dim=embed_dim,
+                input_resolution=(patches_resolution[0], patches_resolution[1]),
+                depth=depths[i_layer],
+                d_state=d_state,
+                mlp_ratio=self.mlp_ratio,
+                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                norm_layer=norm_layer,
+                downsample=None,
+                use_checkpoint=use_checkpoint,
+                img_size=img_size,
+                patch_size=patch_size,
+                resi_connection=resi_connection,
+                is_light_sr=self.is_light_sr,
+            )
+            self.layers.append(layer)
+        self.norm = norm_layer(self.num_features)
+
+        if resi_connection == '1conv':
+            self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
+        elif resi_connection == '3conv':
+            self.conv_after_body = nn.Sequential(
+                nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1))
+
+        # 3. High-quality image reconstruction
+        if self.upsampler == 'pixelshuffle':
+            self.conv_before_upsample = nn.Sequential(
+                nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True))
+            self.upsample = Upsample(upscale, num_feat)
+            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+        elif self.upsampler == 'pixelshuffledirect':
+            self.upsample = UpsampleOneStep(upscale, embed_dim, num_out_ch)
+        else:
+            self.conv_last = nn.Conv2d(embed_dim, num_out_ch, 3, 1, 1)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'absolute_pos_embed'}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {'relative_position_bias_table'}
+
+    def forward_features(self, x):
+        x_size = (x.shape[2], x.shape[3])
+        x = self.patch_embed(x)
+        x = self.pos_drop(x)
+        for layer in self.layers:
+            x = layer(x, x_size)
+        x = self.norm(x)
+        x = self.patch_unembed(x, x_size)
+        return x
+
+    def forward(self, x):
+        self.mean = self.mean.type_as(x)
+        x = (x - self.mean) * self.img_range
+
+        if self.upsampler == 'pixelshuffle':
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.conv_before_upsample(x)
+            x = self.conv_last(self.upsample(x))
+        elif self.upsampler == 'pixelshuffledirect':
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.upsample(x)
+        else:
+            x_first = self.conv_first(x)
+            res = self.conv_after_body(self.forward_features(x_first)) + x_first
+            x = x + self.conv_last(res)
+
+        x = x / self.img_range + self.mean
+        return x
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Enhancement: MambaIR_MCSA  —  MambaIR + Mamba-Conditioned Spatial Attention
+#
+# Motivation:
+#   The baseline VSSBlock uses Channel Attention (CA) inside CAB to mitigate
+#   hidden-state channel redundancy.  However, Mamba's 1D sequence scanning
+#   intrinsically lacks spatial focus ("local pixel forgetting").  MCSA fixes
+#   this by conditioning a spatial attention map directly on the globally-aware
+#   VSSM output, letting the network dynamically highlight high-frequency
+#   spatial structures (edges, textures) using global context.
+#
+# Design:
+#   • CA is intentionally KEPT — it addresses channel redundancy (orthogonal).
+#   • MCSA is inserted AFTER SS2D, BEFORE the skip-add:
+#       input → LN → SS2D → MCSA(SS2D_out) → skip-add → CAB(+CA) → output
+#   • MCSA = global_gate [B,1,1,1]  ×  spatial_conv [B,1,H,W]
+#       - global_gate  : AdaptiveAvgPool -> 2xConv1x1 -> Sigmoid
+#       - spatial_conv : channel avg/max squeeze -> Conv7x7 -> Sigmoid
+#   • Residual modulation keeps the VSSM path stable: vssm_out * (1 + MCSA).
+#   • Parameter overhead is tiny because the spatial branch uses only two
+#     squeezed channels instead of a dense C->1 convolution.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class MambaSpatialAttn(nn.Module):
+    """Mamba-Conditioned Spatial Attention (MCSA).
+
+    Takes the 2-D reprojection of the SS2D output as a conditioning signal and
+    produces a pixel-wise attention map in [0, 1].
+
+    The map is the product of two branches:
+      • global_gate  — AdaptiveAvgPool squeezes spatial dims to 1x1, then two
+                       Conv1x1 layers + Sigmoid yield a scalar gate that
+                       encodes which global context should be amplified.
+      • spatial_conv — channel average/max squeeze followed by a Conv7x7 + Sigmoid
+                       captures local high-frequency structure with very low cost.
+
+    Their element-wise product lets global context *modulate* the spatial map,
+    resolving the local pixel forgetting without purely local bias.
+
+    Args:
+        num_feat  (int): Number of input channels (= hidden_dim of VSSBlock).
+        reduction (int): Channel reduction ratio for the global gate.
+                         Default: 8.
+    """
+
+    def __init__(self, num_feat: int, reduction: int = 8):
+        super().__init__()
+
+        # Global context gate: [B, C, H, W] -> [B, 1, 1, 1]
+        self.global_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(num_feat, max(num_feat // reduction, 1), kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(max(num_feat // reduction, 1), 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+        # Spatial path: VSSM-conditioned channel squeeze -> [B, 1, H, W]
+        self.spatial_conv = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, H, W]  — SS2D output reprojected to 2-D spatial layout.
+        Returns:
+            sa_map: [B, 1, H, W]  — spatial attention map in [0, 1].
+        """
+        gate    = self.global_gate(x)    # [B, 1, 1, 1]
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        spatial = self.spatial_conv(torch.cat([avg_out, max_out], dim=1))
+        return gate * spatial            # broadcast → [B, 1, H, W]
+
+
+class VSSBlock_MCSA(nn.Module):
+    """VSSBlock enhanced with Mamba-Conditioned Spatial Attention (MCSA).
+
+    Identical to the baseline VSSBlock except that after SS2D the output is
+    multiplied by a spatial attention map conditioned on the SS2D output itself.
+    The CAB block (including ChannelAttention) is retained unchanged.
+
+    Forward pass:
+        input  [B, L, C]
+          └─ reshape → [B, H, W, C]
+          └─ LN₁
+          └─ SS2D   → vssm_out  [B, H, W, C]
+          └─ MCSA(vssm_out)     → vssm_attended  [B, H, W, C]
+          └─ x = input·skip₁ + drop_path(vssm_attended)
+          └─ x = x·skip₂     + CAB(LN₂(x))       ← CA preserved
+          └─ reshape → [B, L, C]
+    """
+
+    def __init__(
+            self,
+            hidden_dim: int = 0,
+            drop_path: float = 0,
+            norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+            attn_drop_rate: float = 0,
+            d_state: int = 16,
+            expand: float = 2.,
+            is_light_sr: bool = False,
+            **kwargs,
+    ):
+        super().__init__()
+        self.ln_1           = norm_layer(hidden_dim)
+        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,
+                                   expand=expand, dropout=attn_drop_rate, **kwargs)
+        self.drop_path      = DropPath(drop_path)
+        self.skip_scale     = nn.Parameter(torch.ones(hidden_dim))
+
+        # ── MCSA: conditioned on SS2D output ──────────────────────────────
+        self.spatial_attn   = MambaSpatialAttn(hidden_dim)
+        # ──────────────────────────────────────────────────────────────────
+
+        self.conv_blk       = CAB(hidden_dim, is_light_sr)   # CA retained
+        self.ln_2           = nn.LayerNorm(hidden_dim)
+        self.skip_scale2    = nn.Parameter(torch.ones(hidden_dim))
+
+    def forward(self, input: torch.Tensor, x_size) -> torch.Tensor:
+        B, L, C = input.shape
+        input = input.view(B, *x_size, C).contiguous()   # [B, H, W, C]
+
+        # ── 1. VSSM ───────────────────────────────────────────────────────
+        x        = self.ln_1(input)
+        vssm_out = self.self_attention(x)                 # [B, H, W, C]
+
+        # ── 2. MCSA — condition spatial attention on VSSM output ──────────
+        vssm_2d      = vssm_out.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+        sa_map       = self.spatial_attn(vssm_2d)                  # [B, 1, H, W]
+        sa_map       = sa_map.permute(0, 2, 3, 1)                  # [B, H, W, 1]
+        vssm_attended = vssm_out * (1.0 + sa_map)                  # [B, H, W, C]
+
+        # ── 3. Skip-add + CAB (with CA) ───────────────────────────────────
+        x = input * self.skip_scale + self.drop_path(vssm_attended)
+        x = x * self.skip_scale2 + self.conv_blk(
+            self.ln_2(x).permute(0, 3, 1, 2).contiguous()
+        ).permute(0, 2, 3, 1).contiguous()
+
+        return x.view(B, -1, C).contiguous()
+
+
+class BasicLayer_MCSA(nn.Module):
+    """BasicLayer variant that stacks VSSBlock_MCSA blocks."""
+
+    def __init__(self, dim, input_resolution, depth, drop_path=0., d_state=16,
+                 mlp_ratio=2., norm_layer=nn.LayerNorm, downsample=None,
+                 use_checkpoint=False, is_light_sr=False):
+        super().__init__()
+        self.dim              = dim
+        self.input_resolution = input_resolution
+        self.depth            = depth
+        self.mlp_ratio        = mlp_ratio
+        self.use_checkpoint   = use_checkpoint
+
+        self.blocks = nn.ModuleList([
+            VSSBlock_MCSA(
+                hidden_dim=dim,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                norm_layer=nn.LayerNorm,
+                attn_drop_rate=0,
+                d_state=d_state,
+                expand=self.mlp_ratio,
+                input_resolution=input_resolution,
+                is_light_sr=is_light_sr,
+            )
+            for i in range(depth)
+        ])
+
+        self.downsample = (
+            downsample(input_resolution, dim=dim, norm_layer=norm_layer)
+            if downsample is not None else None
+        )
+
+    def forward(self, x, x_size):
+        for blk in self.blocks:
+            x = checkpoint.checkpoint(blk, x, x_size) if self.use_checkpoint else blk(x, x_size)
+        if self.downsample is not None:
+            x = self.downsample(x)
+        return x
+
+    def extra_repr(self) -> str:
+        return f'dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}'
+
+
+class ResidualGroup_MCSA(nn.Module):
+    """ResidualGroup using BasicLayer_MCSA (SS2D → MCSA → CAB+CA)."""
+
+    def __init__(self, dim, input_resolution, depth, d_state=16, mlp_ratio=4.,
+                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None,
+                 use_checkpoint=False, img_size=None, patch_size=None,
+                 resi_connection='1conv', is_light_sr=False):
+        super().__init__()
+        self.dim              = dim
+        self.input_resolution = input_resolution
+
+        self.residual_group = BasicLayer_MCSA(
+            dim=dim,
+            input_resolution=input_resolution,
+            depth=depth,
+            d_state=d_state,
+            mlp_ratio=mlp_ratio,
+            drop_path=drop_path,
+            norm_layer=norm_layer,
+            downsample=downsample,
+            use_checkpoint=use_checkpoint,
+            is_light_sr=is_light_sr,
+        )
+
+        if resi_connection == '1conv':
+            self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
+        elif resi_connection == '3conv':
+            self.conv = nn.Sequential(
+                nn.Conv2d(dim, dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(dim // 4, dim // 4, 1, 1, 0), nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(dim // 4, dim, 3, 1, 1))
+
+        self.patch_embed   = PatchEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim, norm_layer=None)
+        self.patch_unembed = PatchUnEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim, norm_layer=None)
+
+    def forward(self, x, x_size):
+        return self.patch_embed(
+            self.conv(self.patch_unembed(self.residual_group(x, x_size), x_size))
+        ) + x
+
+
+@ARCH_REGISTRY.register()
+class MambaIR_MCSA(nn.Module):
+    r"""MambaIR_MCSA — MambaIR enhanced with Mamba-Conditioned Spatial Attention.
+
+    Every VSSBlock gains a MambaSpatialAttn module that is conditioned on the
+    VSSM (SS2D) output.  The existing ChannelAttention inside CAB is preserved.
+    This addresses the spatial locality blindness of 1-D Mamba scanning while
+    retaining the channel-redundancy mitigation of CA.
+
+    All constructor arguments are identical to MambaIR.
+    """
+
+    def __init__(self,
+                 img_size=64,
+                 patch_size=1,
+                 in_chans=3,
+                 embed_dim=96,
+                 depths=(6, 6, 6, 6),
+                 drop_rate=0.,
+                 d_state=16,
+                 mlp_ratio=2.,
+                 drop_path_rate=0.1,
+                 norm_layer=nn.LayerNorm,
+                 patch_norm=True,
+                 use_checkpoint=False,
+                 upscale=2,
+                 img_range=1.,
+                 upsampler='',
+                 resi_connection='1conv',
+                 **kwargs):
+        super(MambaIR_MCSA, self).__init__()
+        num_in_ch  = in_chans
+        num_out_ch = in_chans
+        num_feat   = 64
+        self.img_range = img_range
+        if in_chans == 3:
+            rgb_mean = (0.4488, 0.4371, 0.4040)
+            self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
+        else:
+            self.mean = torch.zeros(1, 1, 1, 1)
+        self.upscale   = upscale
+        self.upsampler = upsampler
+        self.mlp_ratio = mlp_ratio
+
+        # 1. Shallow feature extraction
+        self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
+
+        # 2. Deep feature extraction
+        self.num_layers   = len(depths)
+        self.embed_dim    = embed_dim
+        self.patch_norm   = patch_norm
+        self.num_features = embed_dim
+
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=embed_dim,
+            embed_dim=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
+        patches_resolution    = self.patch_embed.patches_resolution
+        self.patches_resolution = patches_resolution
+
+        self.patch_unembed = PatchUnEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=embed_dim,
+            embed_dim=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
+
+        self.pos_drop  = nn.Dropout(p=drop_rate)
+        self.is_light_sr = (self.upsampler == 'pixelshuffledirect')
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+
+        # Build RSSG layers with MCSA-enhanced VSSBlocks
+        self.layers = nn.ModuleList()
+        for i_layer in range(self.num_layers):
+            layer = ResidualGroup_MCSA(
+                dim=embed_dim,
+                input_resolution=(patches_resolution[0], patches_resolution[1]),
+                depth=depths[i_layer],
+                d_state=d_state,
+                mlp_ratio=self.mlp_ratio,
+                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                norm_layer=norm_layer,
+                downsample=None,
+                use_checkpoint=use_checkpoint,
+                img_size=img_size,
+                patch_size=patch_size,
+                resi_connection=resi_connection,
+                is_light_sr=self.is_light_sr,
+            )
+            self.layers.append(layer)
+        self.norm = norm_layer(self.num_features)
+
+        if resi_connection == '1conv':
+            self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
+        elif resi_connection == '3conv':
+            self.conv_after_body = nn.Sequential(
+                nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0),
+                nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1))
+
+        # 3. High-quality image reconstruction
+        if self.upsampler == 'pixelshuffle':
+            self.conv_before_upsample = nn.Sequential(
+                nn.Conv2d(embed_dim, num_feat, 3, 1, 1), nn.LeakyReLU(inplace=True))
+            self.upsample  = Upsample(upscale, num_feat)
+            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+        elif self.upsampler == 'pixelshuffledirect':
+            self.upsample = UpsampleOneStep(upscale, embed_dim, num_out_ch)
+        else:
+            self.conv_last = nn.Conv2d(embed_dim, num_out_ch, 3, 1, 1)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'absolute_pos_embed'}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {'relative_position_bias_table'}
+
+    def forward_features(self, x):
+        x_size = (x.shape[2], x.shape[3])
+        x = self.patch_embed(x)
+        x = self.pos_drop(x)
+        for layer in self.layers:
+            x = layer(x, x_size)
+        x = self.norm(x)
+        x = self.patch_unembed(x, x_size)
+        return x
+
+    def forward(self, x):
+        self.mean = self.mean.type_as(x)
+        x = (x - self.mean) * self.img_range
+
+        if self.upsampler == 'pixelshuffle':
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.conv_before_upsample(x)
+            x = self.conv_last(self.upsample(x))
+        elif self.upsampler == 'pixelshuffledirect':
+            x = self.conv_first(x)
+            x = self.conv_after_body(self.forward_features(x)) + x
+            x = self.upsample(x)
+        else:
+            x_first = self.conv_first(x)
+            res = self.conv_after_body(self.forward_features(x_first)) + x_first
+            x = x + self.conv_last(res)
+
+        x = x / self.img_range + self.mean
+        return x
